@@ -3121,17 +3121,26 @@ pub fn filter_frame_rows_pre(
         [chroma_qp_offset; 2],
         offset_a,
         offset_b,
+        &[],
         info,
     )
 }
 
-/// [`filter_frame_rows_pre`] with a separate chroma QP offset per chroma
-/// component: `chroma_qp_offsets = [chroma_qp_index_offset,
-/// second_chroma_qp_index_offset]` (spec §7.4.2.2, §8.7.2.2). The Cb edges
-/// take their `QPc` from the first offset and the Cr edges from the second,
-/// so a High-profile PPS that signals two different offsets deblocks Cr with
-/// its own strength rather than Cb's.
-pub fn filter_frame_rows_pre_cbcr(
+/// [`filter_frame_rows_pre`] for a picture whose slices carry DIFFERENT
+/// alpha/beta offsets: `mb_offsets[addr] = [FilterOffsetA, FilterOffsetB]` of
+/// the slice containing macroblock `addr`, frame-sized like `mb_qp`. Every
+/// edge a macroblock filters (its left, top and internal edges) takes the
+/// offsets of that macroblock's slice, the one containing q0 (spec §8.7.2.2).
+/// An empty `mb_offsets` means every macroblock uses `offset_a` / `offset_b`.
+///
+/// `chroma_qp_offsets = [chroma_qp_index_offset, second_chroma_qp_index_offset]`
+/// (spec §7.4.2.2, §8.7.2.2): the Cb edges take their `QPc` from the first
+/// offset and the Cr edges from the second.
+///
+/// Per-slice ENABLE (`disable_deblocking_filter_idc`) is not a parameter here:
+/// the caller zeroes the stored strengths of a macroblock whose slice disables
+/// the filter, which skips all of its edges by the all-zero early-out.
+pub fn filter_frame_rows_pre_slices(
     y: &mut [u8],
     u: &mut [u8],
     v: &mut [u8],
@@ -3142,10 +3151,11 @@ pub fn filter_frame_rows_pre_cbcr(
     chroma_qp_offsets: [i32; 2],
     offset_a: i32,
     offset_b: i32,
+    mb_offsets: &[[i8; 2]],
     info: &BlockInfo,
 ) {
     filter_frame_rows_impl::<true>(
-        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offsets, offset_a, offset_b, info,
+        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offsets, offset_a, offset_b, mb_offsets, info,
     )
 }
 
@@ -3173,6 +3183,7 @@ pub fn filter_frame_rows(
         [chroma_qp_offset; 2],
         offset_a,
         offset_b,
+        &[],
         info,
     )
 }
@@ -3223,6 +3234,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
     chroma_qp_offsets: [i32; 2],
     offset_a: i32,
     offset_b: i32,
+    mb_offsets: &[[i8; 2]],
     info: &BlockInfo,
 ) {
     let _g = crate::prof::scope(crate::prof::Stage::Deblock);
@@ -3300,6 +3312,12 @@ fn filter_frame_rows_impl<const PRE: bool>(
             None
         } else {
             Some(&info.t8x8[row0..][..mb_w])
+        };
+        // Per-slice alpha/beta offsets (empty = one set for the whole picture).
+        let off_row = if mb_offsets.is_empty() {
+            None
+        } else {
+            Some(&mb_offsets[row0..][..mb_w])
         };
         for mb_x in 0..mb_w {
             // `t8x8` may be empty (no MB uses the 8×8 transform — Baseline); treat
@@ -3415,6 +3433,11 @@ fn filter_frame_rows_impl<const PRE: bool>(
             // jump for a derivation that had already happened. Every macroblock
             // that reaches this point has a non-zero group (the all-zero test
             // above), and the internal groups are the common ones.
+            // This macroblock's slice offsets: every edge it filters has q0 in it.
+            let (offset_a, offset_b) = match off_row {
+                Some(o) => (o[mb_x][0] as i32, o[mb_x][1] as i32),
+                None => (offset_a, offset_b),
+            };
             let qp_cur = qp_row[mb_x] as i32;
             // Neighbour QPs are only read on a MACROBLOCK edge, and both the
             // luma and the chroma loops want the same two values - previously
