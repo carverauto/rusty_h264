@@ -218,6 +218,14 @@ struct SliceDeblock {
     off: [i8; 2],
 }
 
+/// Bit position of the `rbsp_stop_one_bit`: the last set bit of `rbsp`
+/// (`None` for an all-zero buffer, which has no trailing bits at all).
+fn rbsp_stop_bit(rbsp: &[u8]) -> Option<usize> {
+    let i = rbsp.iter().rposition(|&b| b != 0)?;
+    let last = *rbsp.get(i)?;
+    Some(i * 8 + 7 - last.trailing_zeros() as usize)
+}
+
 /// Reconstructed coded-size planes plus CAVLC `nnz` context grids.
 pub struct FrameDecoder {
     mb_w: usize,
@@ -5483,6 +5491,17 @@ impl FrameDecoder {
             if !r.more_rbsp_data() {
                 break;
             }
+        }
+        // rbsp_slice_trailing_bits (spec §7.3.2.8): the slice data must stop
+        // short of the rbsp_stop_one_bit. `more_rbsp_data()` only says the
+        // reader is AT OR PAST the last set bit; past it means the slice data
+        // consumed that bit as a macroblock bit, i.e. the real trailing bits
+        // are missing (a slice whose final, stop-bit-only byte was lost
+        // decodes every macroblock and used to be accepted). Extra bits
+        // BEFORE the stop bit after the last macroblock are tolerated, as
+        // ffmpeg tolerates them by default.
+        if r.bit_pos() > rbsp_stop_bit(r.data()).unwrap_or(0) {
+            return Err(MbError::Truncated);
         }
         self.edc_flush(); // slice end: no job crosses a slice boundary
         Ok(addr)
