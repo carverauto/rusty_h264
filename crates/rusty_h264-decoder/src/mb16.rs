@@ -10161,7 +10161,20 @@ impl FrameDecoder {
                 *s = v;
             }
         }
-        let avail_corner = avail_top && avail_left && self.intra_nbr_ok(bx - 1, by - 1);
+        // The above-left sample p[-1,-1] has its OWN availability (spec
+        // §6.4.11.2 neighbour D): its macroblock may belong to an earlier slice
+        // while the top and left ones belong to this one (a slice starting
+        // just right of it), and under constrained_intra_pred it may be intra
+        // while the top or left is not. It still filters ft[0] / fl[0] in
+        // `intra8x8_pred` on its own, so neither top nor left availability
+        // stands in for it. For block 3 the corner is this macroblock's own
+        // (intra) block 0, available by construction, as in `gather_i4`.
+        let interior = (bx & 3) > 0 && (by & 3) > 0;
+        let avail_corner = bx > 0
+            && by > 0
+            && (interior
+                || (self.nbr_in_slice((bx - 1) / 4, (by - 1) / 4)
+                    && self.intra_nbr_ok(bx - 1, by - 1)));
         if avail_corner {
             corner = self.top_y_px(py, px - 1);
         }
@@ -14358,5 +14371,34 @@ mod tests {
         // The qPi index is clamped into 0..=51 before the lookup.
         assert_eq!(fd(0, -12).chroma_qp_for(5), chroma_qp(0));
         assert_eq!(fd(0, 99).chroma_qp_for(40), chroma_qp(51));
+    }
+
+    /// A 2x2-macroblock picture whose second slice starts at macroblock 1:
+    /// for macroblock 3 the top (1) and left (2) neighbours are in its slice,
+    /// the above-left one (0) is not, so the I_8x8 corner is unavailable and
+    /// the filtered top sample ft[0] must not read it (spec §8.3.2.2.1).
+    #[test]
+    fn i8x8_corner_from_an_earlier_slice_is_unavailable() {
+        let mut d = FrameDecoder::new(2, 2, 26, 0, Vec::new(), 1, false, true, true);
+        d.slice_first_mb = 1;
+        // Row 15 (the bottom row of macroblocks 0 and 1): top samples 100,
+        // and the corner sample of macroblock 3 (x = 15, in macroblock 0) 20.
+        let cw = d.cw;
+        d.rec_y[15 * cw..16 * cw].fill(100);
+        d.rec_y[15 * cw + 15] = 20;
+        let (top, _left, _corner, avail_corner) = d.gather_i8(16, 16, true, true, 4, 4);
+        assert!(!avail_corner, "macroblock 0 is in an earlier slice");
+        // Vertical I_8x8 with zero residual: the unavailable-corner formula
+        // gives (3 * 100 + 100 + 2) >> 2 = 100; reading the corner gave 80.
+        let pred = intra8x8_pred(0, true, true, avail_corner, &top, &[100; 8], 0);
+        assert_eq!(pred[0], 100);
+
+        // Same slice: the corner is available and does filter ft[0].
+        d.slice_first_mb = 0;
+        let (top, _left, corner, avail_corner) = d.gather_i8(16, 16, true, true, 4, 4);
+        assert!(avail_corner);
+        assert_eq!(corner, 20);
+        let pred = intra8x8_pred(0, true, true, avail_corner, &top, &[100; 8], corner);
+        assert_eq!(pred[0], 80); // (20 + 2 * 100 + 100 + 2) >> 2
     }
 }

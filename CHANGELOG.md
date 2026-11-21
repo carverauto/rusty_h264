@@ -8,6 +8,14 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ### Fixed
 
+- **Decoder: an I_8x8 block's above-left sample from another slice is
+  unavailable.** The I_8x8 reference-sample filter uses the above-left sample
+  when it is available, and the decoder took it as available whenever the top
+  and left samples were. When a slice starts just right of a macroblock's
+  above-left neighbour, top and left belong to the macroblock's slice and the
+  corner does not, so the prediction read a sample from another slice. The
+  corner's availability is now its own (slice membership and
+  `constrained_intra_pred`, H.264 §6.4.11.2, §8.3.2.2.1).
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every
