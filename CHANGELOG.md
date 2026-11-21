@@ -8,6 +8,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ### Fixed
 
+- **Decoder: a truncated CABAC slice is an error.** The arithmetic decoder
+  zero-fills past the end of its data, and zeros decode as plausible bins, so a
+  CABAC slice cut off mid-data ran on to the picture's last macroblock and
+  returned a full-size picture with a wrong tail and no error (CAVLC truncation
+  was already reported). A complete slice never reads past its
+  `rbsp_stop_one_bit`; a slice whose arithmetic decoder did now returns
+  `DecodeError::Truncated`.
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every

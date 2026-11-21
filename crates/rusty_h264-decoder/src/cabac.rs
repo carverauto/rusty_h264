@@ -379,6 +379,35 @@ impl<'a> Cabac<'a> {
         ((consumed + 7) >> 3) as usize
     }
 
+    /// Stream bits the engine has consumed: bits shifted into the 9-bit
+    /// offset register count as read, bits still buffered do not (the same
+    /// measure `pcm_start_byte` rounds up).
+    pub fn consumed_bits(&self) -> usize {
+        (self.eng.byte_pos * 8).saturating_sub(self.eng.cnt.max(0) as usize)
+    }
+
+    /// Whether the engine has read past the slice data: past the
+    /// `rbsp_stop_one_bit` (the last set bit of the RBSP), and in particular
+    /// past the end of the buffer, where `refill` zero-fills. The encoder's
+    /// flush at `end_of_slice_flag` writes the stop bit as the last of its
+    /// final bits (spec §9.3.4.5), and decoding the terminating bin reads no
+    /// further than that, so a complete slice never trips this (measured: on
+    /// x264 and this crate's own encoder output the engine stops 0..=7 bits
+    /// short of the stop bit, never past it). A slice cut short does trip
+    /// it: its zero-filled tail was decoded as if it were data.
+    pub fn overread(&self) -> bool {
+        let stop_end = self
+            .data
+            .iter()
+            .rposition(|&b| b != 0)
+            .and_then(|i| {
+                let last = *self.data.get(i)?;
+                Some(i * 8 + 8 - last.trailing_zeros() as usize)
+            })
+            .unwrap_or(0);
+        self.consumed_bits() > stop_end
+    }
+
     /// Re-initializes the arithmetic engine at absolute `byte` (spec 9.3.1.2,
     /// invoked after the I_PCM samples), KEEPING the adaptive context models --
     /// only the engine registers restart. Mirrors the tail of [`Cabac::new`].
