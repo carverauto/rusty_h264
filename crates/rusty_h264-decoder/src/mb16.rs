@@ -14595,7 +14595,7 @@ mod tests {
     /// the filtered top sample ft[0] must not read it (spec §8.3.2.2.1).
     #[test]
     fn i8x8_corner_from_an_earlier_slice_is_unavailable() {
-        let mut d = FrameDecoder::new(2, 2, 26, 0, Vec::new(), 1, false, true, true);
+        let mut d = FrameDecoder::new(2, 2, 26, [0; 2], Vec::new(), 1, false, true, true);
         d.slice_first_mb = 1;
         // Row 15 (the bottom row of macroblocks 0 and 1): top samples 100,
         // and the corner sample of macroblock 3 (x = 15, in macroblock 0) 20.
