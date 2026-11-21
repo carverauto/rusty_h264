@@ -8,6 +8,16 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ### Fixed
 
+- **Decoder: each macroblock is deblocked with its own slice's filter
+  parameters.** `disable_deblocking_filter_idc` and the alpha/beta offsets are
+  per slice, and the loop filter applies those of the slice containing the
+  macroblock it filters (H.264 §8.7). The decoder filtered each completed
+  macroblock row with the parameters of whichever slice was being decoded when
+  the row completed, stopped filtering rows for the rest of the picture once any
+  slice disabled the filter, and finished the picture with the last slice's
+  settings, so a multi-slice picture whose slices disagree decoded wrong with
+  no error. Pictures whose slices all carry the same parameters, including
+  every single-slice picture, decode byte-identically to before.
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every

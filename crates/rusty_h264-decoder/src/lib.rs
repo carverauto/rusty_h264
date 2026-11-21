@@ -1009,9 +1009,9 @@ struct PendingPic {
     next_mb: usize,
     total_mb: usize,
     slice_count: u16,
+    /// Any slice of the picture enables the loop filter. Each macroblock is
+    /// filtered with its own slice's parameters (`FrameDecoder::deblock`).
     deblock: bool,
-    filter_offset_a: i32,
-    filter_offset_b: i32,
     crop_r: usize,
     crop_b: usize,
     max_refs: usize,
@@ -1657,8 +1657,6 @@ impl Decoder {
                 total_mb: sps.pic_width_in_mbs * sps.pic_height_in_mbs,
                 slice_count: 0,
                 deblock,
-                filter_offset_a,
-                filter_offset_b,
                 crop_r: sps.frame_crop_right as usize,
                 // into_frame crops in units of 2 luma rows; CropUnitY is 4 when field
                 // coding is permitted.
@@ -1695,10 +1693,10 @@ impl Decoder {
             if let Some(w) = weights {
                 pic.fd.set_weights(w);
             }
-            // Latest slice's marking/deblock parameters win at finalization.
-            pic.deblock = deblock;
-            pic.filter_offset_a = filter_offset_a;
-            pic.filter_offset_b = filter_offset_b;
+            // Marking accumulates across slices. Deblocking is per slice (the
+            // FrameDecoder records each slice's parameters); the picture only
+            // needs to know whether any slice filters at all.
+            pic.deblock |= deblock;
             pic.idr_long_term |= idr_long_term;
             pic.mmco_ops.extend(mmco_ops);
         }
@@ -1794,8 +1792,6 @@ impl Decoder {
             frame_num,
             poc,
             deblock,
-            filter_offset_a,
-            filter_offset_b,
             crop_r,
             crop_b,
             max_refs,
@@ -1814,7 +1810,7 @@ impl Decoder {
         // set; decode WORK is unchanged (the filter reads and writes samples but
         // decides nothing), so the timing stays comparable.
         if deblock && !abl_deblock() {
-            fd.deblock(filter_offset_a, filter_offset_b);
+            fd.deblock();
         } else {
             fd.flush_deferred();
         }

@@ -204,6 +204,20 @@ fn publish_filtered_rows_to_slot(
     slot.publish_ready_rows(mb_rows * 16);
 }
 
+/// One slice's loop-filter parameters, recorded in decode order.
+#[derive(Clone, Copy, Debug)]
+struct SliceDeblock {
+    /// First macroblock address of the slice.
+    first_mb: usize,
+    /// `disable_deblocking_filter_idc == 2`: no filtering across this slice's
+    /// boundaries with other slices.
+    idc2: bool,
+    /// `disable_deblocking_filter_idc != 1`.
+    ena: bool,
+    /// `[FilterOffsetA, FilterOffsetB]`.
+    off: [i8; 2],
+}
+
 /// Reconstructed coded-size planes plus CAVLC `nnz` context grids.
 pub struct FrameDecoder {
     mb_w: usize,
@@ -289,12 +303,32 @@ pub struct FrameDecoder {
     /// residual-coded MBs this picture. Two integer adds per MB, no atomics.
     route_skip_mbs: u32,
     route_coded_mbs: u32,
-    /// Per-slice `(first_mb, idc == 2)` in decode order — drives the
-    /// `disable_deblocking_filter_idc == 2` cross-slice-edge suppression.
-    slice_bounds: Vec<(usize, bool)>,
+    /// Every slice of this picture so far, in decode order, with its loop
+    /// filter parameters — drives the `disable_deblocking_filter_idc == 2`
+    /// cross-slice-edge suppression and the per-slice filter enable/offsets.
+    slice_bounds: Vec<SliceDeblock>,
     /// The CURRENT slice's `disable_deblocking_filter_idc == 2`, latched by
     /// `set_deblock_params` and recorded per slice by the decode loops.
     cur_idc2: bool,
+    /// The CURRENT slice's filter enable (`disable_deblocking_filter_idc != 1`)
+    /// and `FilterOffsetA`/`FilterOffsetB`, latched by `set_deblock_params`.
+    cur_ena: bool,
+    cur_oa: i32,
+    cur_ob: i32,
+    /// True once any slice of this picture DISABLES the filter while another
+    /// slice may enable it: `derive_bs_row` then zeroes the strengths of every
+    /// macroblock of a disabling slice.
+    any_off: bool,
+    /// True once two filtering slices of this picture carry different
+    /// alpha/beta offsets: the filter then reads per-macroblock offsets from
+    /// `mb_dboff` instead of the picture-wide `db_oa`/`db_ob`.
+    db_mixed: bool,
+    /// Rows completed while no slice of the picture had filtered yet: they hold
+    /// only non-filtering macroblocks, so the picture-end pass starts past them.
+    nofilt_rows: usize,
+    /// Per-macroblock `[FilterOffsetA, FilterOffsetB]` of the owning slice,
+    /// filled row by row; allocated only once `db_mixed` is set.
+    mb_dboff: Vec<[i8; 2]>,
     /// Per-macroblock `transform_size_8x8_flag` (for deblocking: internal 4×4
     /// luma edges of 8×8-transform MBs are not filtered).
     mb_t8x8: Vec<bool>,
@@ -367,7 +401,9 @@ pub struct FrameDecoder {
     edc_batch: Vec<EdcJob>,
     /// D12: bits/MB carried in from previous slices (0 = not yet known).
     bits_per_mb: f64,
-    /// Current slice's deblock parameters (set per slice by the caller).
+    /// Picture-level deblock state: `db_ena` is set once ANY slice of the
+    /// picture filters; `db_oa`/`db_ob` are the offsets of the first filtering
+    /// slice (every filtering slice's, unless `db_mixed`).
     db_ena: bool,
     db_oa: i32,
     db_ob: i32,
@@ -886,6 +922,13 @@ impl FrameDecoder {
             route_coded_mbs: 0,
             slice_bounds: Vec::new(),
             cur_idc2: false,
+            cur_ena: false,
+            cur_oa: 0,
+            cur_ob: 0,
+            any_off: false,
+            db_mixed: false,
+            nofilt_rows: 0,
+            mb_dboff: Vec::new(),
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
             mb_umot: refill(pool.mb_umot, mb_w * mb_h, false),
             // NO FILL (Ir vein V4): `derive_bs_row(r)` assigns every record of row
@@ -1432,21 +1475,102 @@ impl FrameDecoder {
 
     /// Per-slice deblock parameters, needed DURING decode by the row-interleave
     /// path. `ena` is already resolved against `RFF_ABL_DEBLOCK` by the caller.
+    /// They take effect for the macroblocks of the slice the decode loop opens
+    /// next (`open_slice`).
+    ///
+    /// Each macroblock's edges are filtered with the parameters of ITS slice
+    /// (spec §8.7: the slice containing q0), so a picture whose slices disagree
+    /// is not "the last slice wins": a disabling slice's macroblocks get zero
+    /// strengths (`any_off`), and filtering slices with different offsets read
+    /// them per macroblock (`db_mixed`). The picture-level state is folded in
+    /// HERE, before the slice's decode loop starts, because the EDC worker
+    /// snapshots it when the loop is entered.
     pub fn set_deblock_params(&mut self, ena: bool, oa: i32, ob: i32, idc2: bool) {
-        // Latch: the FIRST disabling slice turns row filtering off for the rest
-        // of the picture (see `row_hook`); rows already filtered stay counted
-        // in `flt_rows` and the picture-end tail handles the remainder.
-        self.db_ena = ena && (self.flt_rows == 0 || self.db_ena);
-        self.db_oa = oa;
-        self.db_ob = ob;
+        self.cur_ena = ena;
+        self.cur_oa = oa;
+        self.cur_ob = ob;
         self.cur_idc2 = idc2;
+        if !ena {
+            self.any_off = true;
+        } else if !self.db_ena {
+            self.db_ena = true;
+            self.db_oa = oa;
+            self.db_ob = ob;
+        } else if !self.db_mixed && (oa, ob) != (self.db_oa, self.db_ob) {
+            self.db_mixed = true;
+            self.mb_dboff.clear();
+            let uniform = [self.db_oa as i8, self.db_ob as i8];
+            self.mb_dboff.resize(self.mb_w * self.mb_h, uniform);
+        }
+    }
+
+    /// Records the slice starting at `first_mb` with the parameters latched by
+    /// `set_deblock_params`.
+    fn open_slice(&mut self, first_mb: usize) {
+        // FilterOffsetA/B = 2 * slice_*_offset_div2, and div2 is -6..=6 in a
+        // conformant stream; the clamp only keeps a malformed one in `i8`.
+        let off = [
+            self.cur_oa.clamp(-12, 12) as i8,
+            self.cur_ob.clamp(-12, 12) as i8,
+        ];
+        self.slice_bounds.push(SliceDeblock {
+            first_mb,
+            idc2: self.cur_idc2,
+            ena: self.cur_ena,
+            off,
+        });
+        self.any_idc2 |= self.cur_idc2;
     }
 
     /// Slice index owning `addr` (slices are raster-contiguous, bounds ascending).
     fn slice_of(&self, addr: usize) -> usize {
-        match self.slice_bounds.binary_search_by(|&(f, _)| f.cmp(&addr)) {
+        match self
+            .slice_bounds
+            .binary_search_by(|b| b.first_mb.cmp(&addr))
+        {
             Ok(i) => i,
-            Err(i) => i - 1,
+            Err(i) => i.saturating_sub(1),
+        }
+    }
+
+    /// Applies the per-slice filter parameters to macroblock row `r`: zeroes
+    /// the stored strengths of every macroblock whose slice disables the filter
+    /// (`disable_deblocking_filter_idc == 1`: none of ITS edges are filtered,
+    /// while a filtering neighbour still filters the edge it owns against it),
+    /// and records each macroblock's alpha/beta offsets when slices disagree.
+    /// A picture whose slices agree pays one branch per row.
+    fn apply_slice_deblock_row(&mut self, r: usize) {
+        // Only rows that may still be filtered need it: a row completed before
+        // any slice filtered is skipped wholesale (`nofilt_rows`).
+        if !(self.any_off && self.db_ena) && !self.db_mixed {
+            return;
+        }
+        let mb_w = self.mb_w;
+        let row0 = r * mb_w;
+        let mut si = self.slice_of(row0);
+        for mb_x in 0..mb_w {
+            let addr = row0 + mb_x;
+            while self
+                .slice_bounds
+                .get(si + 1)
+                .is_some_and(|b| b.first_mb <= addr)
+            {
+                si += 1;
+            }
+            let Some(&b) = self.slice_bounds.get(si) else {
+                break;
+            };
+            if !b.ena {
+                if let Some(m) = self.bs_frame.get_mut(addr) {
+                    m.v = [[0; 4]; 4];
+                    m.h = [[0; 4]; 4];
+                }
+            }
+            if self.db_mixed {
+                if let Some(o) = self.mb_dboff.get_mut(addr) {
+                    *o = b.off;
+                }
+            }
         }
     }
 
@@ -1754,7 +1878,7 @@ impl FrameDecoder {
             for mb_x in 0..mb_w {
                 let slot = r * mb_w + mb_x;
                 let si = self.slice_of(slot);
-                if !self.slice_bounds.get(si).is_some_and(|b| b.1) {
+                if !self.slice_bounds.get(si).is_some_and(|b| b.idc2) {
                     continue;
                 }
                 if mb_x > 0 && self.slice_of(slot - 1) != si {
@@ -1769,6 +1893,7 @@ impl FrameDecoder {
                 }
             }
         }
+        self.apply_slice_deblock_row(r);
     }
 
     /// Decode-loop hook: called at each MB-loop head with the NEXT address to be
@@ -1854,8 +1979,17 @@ impl FrameDecoder {
                     bs: self.bs_frame[base..base + self.mb_w].to_vec(),
                     qp: self.mb_qp[base..base + self.mb_w].to_vec(),
                     t8: self.mb_t8x8[base..base + self.mb_w].to_vec(),
+                    off: if self.db_mixed {
+                        self.mb_dboff[base..base + self.mb_w].to_vec()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 self.edc_post(msg);
+                if !self.db_ena {
+                    // The worker skips it too (`PixelCtx::db_ena` is this flag).
+                    self.nofilt_rows = r + 1;
+                }
             }
             return;
         }
@@ -1864,14 +1998,17 @@ impl FrameDecoder {
             let r = self.bs_rows;
             self.derive_bs_row(r);
             self.bs_rows += 1;
-            // Row filtering requires deblock enabled on EVERY slice so far
-            // (`db_ena` latches false once any slice disables it): a mixed
-            // picture falls back to the picture-end tail so "latest slice
-            // wins" semantics are preserved.
+            // A completed row can be filtered now: every macroblock in it, and
+            // so every slice parameter it needs, is known (`derive_bs_row`
+            // applied them). Rows completed before any filtering slice
+            // appeared hold only non-filtering macroblocks, so skipping them is
+            // exact.
             if self.db_ena {
                 self.save_bak(r);
                 self.filter_row(r);
                 self.flt_rows = r + 1;
+            } else {
+                self.nofilt_rows = r + 1;
             }
             self.publish_progress();
         }
@@ -1890,10 +2027,8 @@ impl FrameDecoder {
         self.bak_v.copy_from_slice(&self.rec_v[c0..c0 + self.ccw]);
     }
 
-    /// Filters one MB row against the stored strengths, using the CURRENT
-    /// slice's alpha/beta offsets (single-offset streams — the whole corpus —
-    /// are bit-identical to the picture-end call; the plan's risk register
-    /// documents the multi-offset divergence).
+    /// Filters one MB row against the stored strengths, each macroblock with
+    /// the alpha/beta offsets of its own slice (`mb_offsets`).
     fn filter_row(&mut self, r: usize) {
         let info = rusty_h264_common::deblock::BlockInfo {
             inter: &self.inter_y,
@@ -1916,7 +2051,8 @@ impl FrameDecoder {
             poc1: &[],
             kind: &self.mb_kind,
         };
-        rusty_h264_common::deblock::filter_frame_rows_pre(
+        let mb_offsets: &[[i8; 2]] = if self.db_mixed { &self.mb_dboff } else { &[] };
+        rusty_h264_common::deblock::filter_frame_rows_pre_slices(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -1927,6 +2063,7 @@ impl FrameDecoder {
             self.chroma_qp_offset,
             self.db_oa,
             self.db_ob,
+            mb_offsets,
             &info,
         );
     }
@@ -2433,8 +2570,7 @@ impl FrameDecoder {
         // every downstream ctxIdxInc read inherits. Confirmed against ffmpeg
         // on an x264 `--slices 4` stream, which desynced without this.
         self.slice_first_mb = first_mb;
-        self.slice_bounds.push((first_mb, self.cur_idc2));
-        self.any_idc2 |= self.cur_idc2;
+        self.open_slice(first_mb);
         let mut last_delta_qp = 0i32;
         let mut addr = first_mb;
 
@@ -5193,8 +5329,7 @@ impl FrameDecoder {
     ) -> Result<usize, MbError> {
         let total = self.mb_w * self.mb_h;
         self.slice_first_mb = first_mb;
-        self.slice_bounds.push((first_mb, self.cur_idc2));
-        self.any_idc2 |= self.cur_idc2;
+        self.open_slice(first_mb);
         self.edc_active = edc_on();
         let mut addr = first_mb;
         // Same malformed-header divide-by-zero as the sibling slice loop above.
@@ -8530,6 +8665,7 @@ impl FrameDecoder {
             db_ena: self.db_ena,
             db_oa: self.db_oa,
             db_ob: self.db_ob,
+            off_grid: Vec::new(),
             cur_qp: self.cur_qp,
             qp_grid: self.mb_qp.clone(),
             t8_grid: self.mb_t8x8.clone(),
@@ -10389,7 +10525,9 @@ impl FrameDecoder {
         self.edc_flush();
     }
 
-    pub fn deblock(&mut self, offset_a: i32, offset_b: i32) {
+    /// Picture-end loop filter: every row the row-interleave has not filtered
+    /// yet, each macroblock with its own slice's parameters.
+    pub fn deblock(&mut self) {
         self.span_flush(); // deferred grid spans feed bS derivation below
         self.edc_flush(); // backstop: no pixel job may survive to filtering
         self.dump_mb_map();
@@ -10480,8 +10618,16 @@ impl FrameDecoder {
         } else {
             bs_store = Vec::new();
         }
-        let first_row = if rowdb { self.flt_rows } else { 0 };
-        rusty_h264_common::deblock::filter_frame_rows_pre(
+        // Rows completed before any slice filtered hold no filtering
+        // macroblock; their strengths were never masked, so they must not be
+        // revisited here.
+        let first_row = if rowdb {
+            self.flt_rows.max(self.nofilt_rows)
+        } else {
+            0
+        };
+        let mb_offsets: &[[i8; 2]] = if self.db_mixed { &self.mb_dboff } else { &[] };
+        rusty_h264_common::deblock::filter_frame_rows_pre_slices(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -10490,8 +10636,9 @@ impl FrameDecoder {
             first_row..self.mb_h,
             &self.mb_qp,
             self.chroma_qp_offset,
-            offset_a,
-            offset_b,
+            self.db_oa,
+            self.db_ob,
+            mb_offsets,
             &info,
         );
         drop(info);
@@ -11186,6 +11333,9 @@ enum EdcMsg {
         bs: Vec<rusty_h264_common::deblock::MbBs>,
         qp: Vec<u8>,
         t8: Vec<bool>,
+        /// The row's per-macroblock slice offsets; empty unless the picture's
+        /// filtering slices disagree (`FrameDecoder::db_mixed`).
+        off: Vec<[i8; 2]>,
     },
     /// An intra macroblock needs the planes on the parse thread: send the
     /// context over and wait for it to come back.
@@ -11216,6 +11366,9 @@ pub(crate) struct PixelCtx {
     db_ena: bool,
     db_oa: i32,
     db_ob: i32,
+    /// Per-macroblock slice offsets for the rows that carried them (see
+    /// `EdcMsg::Row::off`); empty while the picture's slices agree.
+    off_grid: Vec<[i8; 2]>,
     cur_qp: u8,
     qp_grid: Vec<u8>,
     t8_grid: Vec<bool>,
@@ -11929,7 +12082,7 @@ impl PixelCtx {
             poc1: &[],
             kind: &[],
         };
-        rusty_h264_common::deblock::filter_frame_rows_pre(
+        rusty_h264_common::deblock::filter_frame_rows_pre_slices(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -11940,6 +12093,7 @@ impl PixelCtx {
             self.chroma_qp_offset,
             self.db_oa,
             self.db_ob,
+            &self.off_grid,
             &info,
         );
     }
@@ -12376,11 +12530,15 @@ fn edc_worker(
             EdcMsg::Job(EdcJob::BSkip { mbx, mby, regions }) => {
                 ctx.recon_b_skip(mbx, mby, &regions)
             }
-            EdcMsg::Row { r, bs, qp, t8 } => {
+            EdcMsg::Row { r, bs, qp, t8, off } => {
                 let (w, base) = (ctx.mb_w, r * ctx.mb_w);
                 ctx.bs_store[base..base + w].copy_from_slice(&bs);
                 ctx.qp_grid[base..base + w].copy_from_slice(&qp);
                 ctx.t8_grid[base..base + w].copy_from_slice(&t8);
+                if off.len() == w {
+                    ctx.off_grid.resize(ctx.mb_w * ctx.mb_h, [0; 2]);
+                    ctx.off_grid[base..base + w].copy_from_slice(&off);
+                }
                 if ctx.db_ena {
                     ctx.save_bak(r);
                     ctx.filter_row(r);
