@@ -56,9 +56,9 @@ Input is **Annex-B** (start codes). `YuvFrame` carries raw planar 4:2:0 (I420).
 - **Constrained Baseline** — `I_16x16` / `I_4x4` / `I_PCM` intra, `P_Skip`,
   P 16×16 / 16×8 / 8×16 / `P_8x8`, quarter-pel motion compensation, in-loop
   deblocking, a multi-reference DPB with POC reordering and MMCO.
-- **B-slices** — temporal *and* spatial direct, implicit *and* explicit weighted
+- **B-slices** — temporal *and* spatial direct, implicit weighted
   prediction, the L0 / L1 / Bi partitions, `B_Skip` and `B_Direct`.
-- **Most of High profile (CAVLC)** — the 8×8 integer transform and 8×8 intra
+- **Most of High profile (CAVLC and CABAC)** — the 8×8 integer transform and 8×8 intra
   prediction, sequence and picture **scaling matrices**,
   `transform_size_8x8_flag`, the second chroma QP offset.
 - **CABAC (Main profile)** — I slices (`I_4x4`, `I_16x16` incl. all four 16×16
@@ -68,8 +68,10 @@ Input is **Annex-B** (start codes). `YuvFrame` carries raw planar 4:2:0 (I420).
   temporal direct). Baseline/Main I + P + B streams decode fully pixel-exact
   end to end.
 
-Not yet: CABAC `I_PCM` (errors gracefully), High-profile 8×8 CABAC residual,
-and full JVT-suite conformance.
+Refused with `DecodeError::Unsupported` rather than decoded wrong: interlaced
+(field or MBAFF) coding, slice groups (FMO), SP/SI slices, explicit B weighted
+prediction (`weighted_bipred_idc` 1) and lossless transform-bypass macroblocks.
+Not yet: full JVT-suite conformance.
 
 ## How correctness is enforced
 

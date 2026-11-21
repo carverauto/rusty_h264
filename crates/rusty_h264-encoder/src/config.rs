@@ -598,7 +598,10 @@ impl EncoderConfig {
         }
     }
 
-    /// A minimal all-intra Constrained Baseline configuration at the given size.
+    /// The default configuration at the given size: High profile, CABAC, the
+    /// 8x8 transform, `Preset::Fast`, an IDR every 250 frames with P-frames
+    /// between (see the field defaults below). `RUSTY_H264_LEGACY_CAVLC=1`
+    /// returns [`EncoderConfig::baseline`] instead.
     pub fn new(width: usize, height: usize) -> Self {
         if legacy_cavlc() {
             return Self::baseline(width, height);
