@@ -86,6 +86,19 @@ output bytes ([CHANGELOG](https://github.com/Remade-With-Rust/rusty_h264/blob/ma
 - **Per-GOP I-frame QP cascade** (`i_qp_offset`, default `-3`) — the calibrated
   equivalent of x264's `ip_ratio`, deepened content-adaptively on predictable
   GOPs.
+- **8×8 transform** (`transform_8x8`, default `true`): `I_8x8` intra and the
+  8×8 inter transform, a 3-way per-macroblock RD choice that wins on smooth /
+  large-structure content. Needs High profile (the default; it is turned off for
+  Baseline/Main) and works with CAVLC and CABAC alike.
+- **mb-tree temporal AQ** (`mbtree`, default `true`, with `mbtree_strength` and
+  `mbtree_lookahead`): a lookahead propagates each macroblock's future
+  importance backward along motion vectors and lowers the QP of
+  heavily-referenced macroblocks — the complement to `aq_strength`'s spatial AQ.
+  `LookaheadMode` picks the search resolution — `FullRes` (best), `Hybrid`
+  (half-res search, full-res score/refine — ~1.7× for no measured loss),
+  `HalfRes` (~4×, default).
+- **Multiple reference frames** (`num_ref_frames`, default 3, 1..=16) for
+  P-macroblocks.
 - In-loop deblocking; **average-bitrate rate control** (complexity model +
   leaky-bucket buffer).
 
@@ -94,10 +107,7 @@ output bytes ([CHANGELOG](https://github.com/Remade-With-Rust/rusty_h264/blob/ma
 | Knob | What it buys |
 |---|---|
 | `bframes` / `bframes_adaptive` | B-frames (Main profile) with the reorder pipeline, L0-past + L1-future bi-prediction and spatial/temporal direct. Strongly content-dependent, so `bframes_adaptive` measures the clip's temporal predictability and codes B-frames **only** where they help — capturing the win without ever regressing. |
-| `transform_8x8` | `I_8x8` intra and the 8×8 inter transform, a 3-way per-macroblock RD choice that wins on smooth / large-structure content. Requires High profile, and is CAVLC-only today (the decoder has no CABAC 8×8 residual yet). |
-| `mbtree` + `mbtree_strength` + `mbtree_lookahead` | Temporal AQ: a lookahead propagates each macroblock's future importance backward along motion vectors and lowers the QP of heavily-referenced macroblocks. The complement to `aq_strength`'s spatial AQ. `LookaheadMode` picks the search resolution — `FullRes` (best), `Hybrid` (half-res search, full-res score/refine — ~1.7× for no measured loss), `HalfRes` (~4×, default). |
 | `tune_rd_skip` (+ `tune_rd_skip_min_free`, `tune_rd_skip_fast_t`) | Rate-distortion `P_Skip`: skip when `J = SSD + λ·bits` says so, not only when the residual quantizes to exactly zero. Gated on the frame's online free-skip rate so it engages only on the content where it wins. |
-| `num_ref_frames` | Multiple reference frames for P-macroblocks (1..=16). |
 
 **Default-on for the `Quality` preset** (`None` follows the preset; `Some(b)`
 forces either way):
@@ -118,14 +128,19 @@ worst-clip-≤-0 rule** — never a mean, never a single QP.
 | **`Balanced`** | `Fast`'s decision path | **+ sub-pel refinement** | **−42…−50% BD-rate** vs `Fast` (PSNR and SSIM agree) for ~2.3–3.1× the time. On fine detail it beats `Quality` on *both* size and speed. The `Preset` default. |
 | `Quality` | full RD — every candidate trial-encoded for real `J = SSD + λ·bits` | + `16x8`/`8x16` sub-partitions, full `I_4x4` search | Smallest files, much slower. |
 
-`EncoderConfig::new()` starts at `Preset::Fast` and all-intra (`gop_size = 1`);
-set `preset` and `gop_size` for anything else.
+`EncoderConfig::new()` starts at `Preset::Fast` (not the `Preset` default,
+`Balanced`) with High profile, CABAC, an IDR every 250 frames (`gop_size`, with
+`min_keyint` 25 and scene-cut detection) and P-frames between; set `preset`, and
+`gop_size = 1` for all-intra. `EncoderConfig::baseline()` is the Constrained
+Baseline + CAVLC configuration.
 
 ## Features
 
 | Feature | Default | Effect |
 |---|:--:|---|
-| `asm` | — | Route the hot kernels (DCT/quant, MC, deblock, SATD/SAD) through the portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` intrinsics are quarantined there, so this crate stays `forbid(unsafe)` even with `--features asm`. |
+| `std` | ✅ | Standard-library build; without it the encoder is `no_std` + `alloc` and needs `libm`. |
+| `global-alloc` | ✅ | Installs `rusty_alloc` as the process-wide `#[global_allocator]`; turn it off (`default-features = false`) when the application has its own. |
+| `asm` | ✅ | Route the hot kernels (DCT/quant, MC, deblock, SATD/SAD) through the portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) in [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel). The `unsafe` intrinsics are quarantined there, so this crate stays `forbid(unsafe)` even with `--features asm`. |
 | `profile` | — | Dev-only `rdtsc` stage profiler (`rusty_h264-common::prof`) — zero cost when off. |
 
 The SIMD SATD kernels are wired into the quality-preset mode decision

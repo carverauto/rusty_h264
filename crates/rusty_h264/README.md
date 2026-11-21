@@ -94,9 +94,9 @@ You never need to name the sub-crates directly — that's the point of the facad
 
 **Decoder** — validated bit-exact vs Cisco `h264dec` over openh264's corpus:
 
-- **Constrained Baseline + B-slices** (temporal & spatial direct, implicit &
-  explicit weighted prediction, L0/L1/Bi partitions, `B_Skip`/`B_Direct`).
-- **Most of High profile (CAVLC):** 8×8 integer transform and 8×8 intra
+- **Constrained Baseline + B-slices** (temporal & spatial direct, implicit
+  weighted prediction, L0/L1/Bi partitions, `B_Skip`/`B_Direct`).
+- **Most of High profile (CAVLC and CABAC):** 8×8 integer transform and 8×8 intra
   prediction, sequence/picture scaling matrices, `transform_size_8x8_flag`,
   second chroma QP offset.
 - **CABAC entropy decode (Main profile):** I slices (`I_4x4`, `I_16x16`),
@@ -120,9 +120,11 @@ You never need to name the sub-crates directly — that's the point of the facad
   pathological content so it never regresses.
 - Per-GOP I-frame QP cascade, in-loop deblocking, average-bitrate rate control
   (complexity model + leaky bucket).
-- Opt-in tools: B-frames (`bframes`, incl. a content-adaptive enable), the 8×8
-  transform (`I_8x8` + inter, High profile), mb-tree temporal AQ with a
-  lookahead, RD `P_Skip`. `P_8x8` sub-partition motion and the adaptive wide
+- Default-on in `EncoderConfig::new`: High profile with the 8×8 transform
+  (`I_8x8` + inter), mb-tree temporal AQ with a lookahead, three reference
+  frames, IDR every 250 frames with scene-cut detection.
+- Opt-in tools: B-frames (`bframes`, incl. a content-adaptive enable), RD
+  `P_Skip`. `P_8x8` sub-partition motion and the adaptive wide
   motion search are default-on for the `Quality` preset.
 - Three presets — `Fast` (SAD, integer-pel), **`Balanced`** (adds sub-pel
   refinement: −42…−50% BD-rate over `Fast` for ~2.3–3.1× the time), `Quality`
@@ -132,12 +134,14 @@ You never need to name the sub-crates directly — that's the point of the facad
 
 | Feature | Default | Effect |
 |---|:--:|---|
+| `std` | ✅ | Standard-library build (the decoder's frame threads, the environment knobs); without it the codec is `no_std` + `alloc` and needs `libm`. |
+| `global-alloc` | ✅ | Installs `rusty_alloc` as the process-wide `#[global_allocator]`. Turn it off (`default-features = false`, then `features = ["std", "asm"]`) when the application has its own allocator. |
 | `asm` | ✅ | portable Rust SIMD (x86-64 SSE2/AVX2, aarch64 NEON) for MC, deblocking, transforms, SATD/SAD. No assembler or build script; the `unsafe` intrinsics are quarantined in `rusty_h264-accel`. |
 | *(none)* | — | `--no-default-features` → scalar-only, 100% safe Rust with no `unsafe` at all. Runs on any Rust target. |
 
-The `asm` kernels are x86-64 only; on other architectures (e.g. arm64 macOS) the
-accel crate compiles to an empty lib and the pure-Rust scalar path is selected
-automatically, so a default-features build works everywhere.
+The `asm` kernels cover x86-64 (SSE2/AVX2) and aarch64 (NEON); on other
+architectures the pure-Rust scalar path is selected automatically, so a
+default-features build works everywhere.
 
 **The codec core is `#![forbid(unsafe_code)]` either way.** All `unsafe` lives in
 the single, optional [`rusty_h264-accel`](https://crates.io/crates/rusty_h264-accel)
