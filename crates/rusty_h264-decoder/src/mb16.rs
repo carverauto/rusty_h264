@@ -213,8 +213,9 @@ pub struct FrameDecoder {
     /// Running luma QP (`QPy`), carried across macroblocks and stepped by each
     /// `mb_qp_delta` (spec §7.4.5). Equals `qp` on constant-QP streams.
     cur_qp: u8,
-    /// `chroma_qp_index_offset` from the active PPS (§8.5.8).
-    chroma_qp_offset: i32,
+    /// `[chroma_qp_index_offset, second_chroma_qp_index_offset]` from the
+    /// active PPS (§7.4.2.2, §8.5.8): the Cb and the Cr QP offset.
+    chroma_qp_offset: [i32; 2],
     cw: usize,
     ch: usize,
     ccw: usize,
@@ -781,7 +782,7 @@ impl FrameDecoder {
         mb_w: usize,
         mb_h: usize,
         qp: u8,
-        chroma_qp_offset: i32,
+        chroma_qp_offset: [i32; 2],
         refs: Vec<crate::Ref>,
         num_ref_active: usize,
         constrained_intra: bool,
@@ -807,7 +808,7 @@ impl FrameDecoder {
         mb_w: usize,
         mb_h: usize,
         qp: u8,
-        chroma_qp_offset: i32,
+        chroma_qp_offset: [i32; 2],
         refs: Vec<crate::Ref>,
         num_ref_active: usize,
         constrained_intra: bool,
@@ -1255,11 +1256,17 @@ impl FrameDecoder {
         Ok(())
     }
 
-    /// Maps a luma QP to its chroma QP, applying `chroma_qp_index_offset`
-    /// (spec §8.5.8): `QPc = qpc_table(Clip3(0, 51, QPy + offset))`.
-    fn chroma_qp_for(&self, qp_y: u8) -> u8 {
-        let qpi = (qp_y as i32 + self.chroma_qp_offset).clamp(0, 51) as u8;
+    /// Maps a luma QP to the chroma QP of component `c` (0 = Cb, 1 = Cr),
+    /// applying that component's PPS offset (spec §8.5.8):
+    /// `QPc = qpc_table(Clip3(0, 51, QPy + offset[c]))`.
+    fn chroma_qp_for(&self, qp_y: u8, c: usize) -> u8 {
+        let qpi = (qp_y as i32 + self.chroma_qp_offset[c & 1]).clamp(0, 51) as u8;
         chroma_qp(qpi)
+    }
+
+    /// Both chroma QPs `[QPc(Cb), QPc(Cr)]` for luma QP `qp_y`.
+    fn chroma_qps(&self, qp_y: u8) -> [u8; 2] {
+        [self.chroma_qp_for(qp_y, 0), self.chroma_qp_for(qp_y, 1)]
     }
 
     /// Resets per-slice state before decoding a continuation slice of the same
@@ -1916,7 +1923,7 @@ impl FrameDecoder {
             poc1: &[],
             kind: &self.mb_kind,
         };
-        rusty_h264_common::deblock::filter_frame_rows_pre(
+        rusty_h264_common::deblock::filter_frame_rows_pre_cbcr(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -4537,7 +4544,7 @@ impl FrameDecoder {
         let cac = cac.unwrap_or(&ZERO_CAC);
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecResidAdd);
         let qp = self.cur_qp;
-        let qpc = self.chroma_qp_for(qp);
+        let qpc = self.chroma_qps(qp);
         let (w4r, w2r) = (self.mb_w * 4, self.mb_w * 2);
         if let Some(l8) = luma8 {
             // INTER 8x8 luma: same primitives the I_8x8 and CAVLC paths use.
@@ -4721,9 +4728,9 @@ impl FrameDecoder {
         }
         let mut c_dc = [[0i32; 4]; 2];
         for c in 0..2 {
-            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
+            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc[c], 4 + c);
         }
-        let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
+        let dqc = [self.dq_const(qpc[0], 4), self.dq_const(qpc[1], 5)];
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut ac_nz = false;
@@ -4995,10 +5002,10 @@ impl FrameDecoder {
         qac: &[[[i32; 16]; 4]; 2],
         coded: [u8; 2],
         dc: &[[i32; 4]; 2],
-        qpc: u8,
+        qpc: [u8; 2],
     ) {
         let (cx, cy) = (mb_x * 8, mb_y * 8);
-        let dqc = [self.dq_const(qpc, 1), self.dq_const(qpc, 2)];
+        let dqc = [self.dq_const(qpc[0], 1), self.dq_const(qpc[1], 2)];
         for c in 0..2 {
             let mut ctop = [0u8; 8];
             let mut cleft = [0u8; 8];
@@ -5082,11 +5089,11 @@ impl FrameDecoder {
         // `None` = no chroma AC was parsed; every read below is already gated
         // on cbp_chroma == 2, so the shared zero plane is read-equivalent.
         let cac = cac.unwrap_or(&ZERO_CAC);
-        let qpc = self.chroma_qp_for(self.cur_qp);
+        let qpc = self.chroma_qps(self.cur_qp);
         let mut c_dc = [[0i32; 4]; 2];
         if cbp_chroma != 0 {
             for c in 0..2 {
-                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 1 + c);
+                c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc[c], 1 + c);
             }
         }
         // ENTROPY-SIDE half: un-scan the AC into raster + commit nnz_c; the
@@ -5588,7 +5595,7 @@ impl FrameDecoder {
         if cbp != 0 {
             self.step_qp(r.read_se()?)?;
         }
-        let (qp, _qpc) = (self.cur_qp, self.chroma_qp_for(self.cur_qp));
+        let qp = self.cur_qp;
 
         // ---- luma residual ----
         // ONLY WHEN SOMETHING READS IT (Ir vein V9, 2026-11-08): the neighbour
@@ -10269,7 +10276,7 @@ impl FrameDecoder {
         cbp_chroma: u32,
         chroma_mode: u8,
     ) -> Result<(), MbError> {
-        let qpc = self.chroma_qp_for(self.cur_qp);
+        let qpc = self.chroma_qps(self.cur_qp);
         let avail_top = mb_y > 0
             && self.nbr_in_slice(mb_x, mb_y - 1)
             && self.intra_nbr_ok(mb_x * 4, mb_y * 4 - 1);
@@ -10282,7 +10289,7 @@ impl FrameDecoder {
             for (c, slot) in c_recon_dc.iter_mut().enumerate() {
                 let mut dc = [0i32; 4];
                 decode_residual_block_into::<4, 4>(r, -1, &mut dc)?;
-                *slot = self.dequant_chroma_dc(&dc, qpc, 1 + c);
+                *slot = self.dequant_chroma_dc(&dc, qpc[c], 1 + c);
             }
         }
         let mut c_q_blocks = [[[0i32; 16]; 4]; 2];
@@ -10481,7 +10488,7 @@ impl FrameDecoder {
             bs_store = Vec::new();
         }
         let first_row = if rowdb { self.flt_rows } else { 0 };
-        rusty_h264_common::deblock::filter_frame_rows_pre(
+        rusty_h264_common::deblock::filter_frame_rows_pre_cbcr(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -11211,7 +11218,7 @@ pub(crate) struct PixelCtx {
     ccw: usize,
     mb_w: usize,
     mb_h: usize,
-    chroma_qp_offset: i32,
+    chroma_qp_offset: [i32; 2],
     flt_rows: usize,
     db_ena: bool,
     db_oa: i32,
@@ -11245,10 +11252,11 @@ impl PixelCtx {
         );
     }
 
-    fn chroma_qp_for(&self, qp: u8) -> u8 {
-        rusty_h264_common::predict::chroma_qp(
-            ((qp as i32 + self.chroma_qp_offset).clamp(0, 51)) as u8,
-        )
+    /// Worker twin of `FrameDecoder::chroma_qps`: `[QPc(Cb), QPc(Cr)]`.
+    fn chroma_qps(&self, qp: u8) -> [u8; 2] {
+        self.chroma_qp_offset.map(|off| {
+            rusty_h264_common::predict::chroma_qp(((qp as i32 + off).clamp(0, 51)) as u8)
+        })
     }
 
     /// Per-(qp, list) dequant constants for the fused scan-order kernel (worker twin).
@@ -11734,7 +11742,7 @@ impl PixelCtx {
         let cac = cac.unwrap_or(&ZERO_CAC);
         let _g = rusty_h264_common::prof::scope(rusty_h264_common::prof::Stage::DecResidAdd);
         let qp = self.cur_qp;
-        let qpc = self.chroma_qp_for(qp);
+        let qpc = self.chroma_qps(qp);
         if let Some(l8) = luma8 {
             // INTER 8x8 luma: same primitives the I_8x8 and CAVLC paths use.
             for b8 in 0..4usize {
@@ -11854,9 +11862,9 @@ impl PixelCtx {
         }
         let mut c_dc = [[0i32; 4]; 2];
         for c in 0..2 {
-            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc, 4 + c);
+            c_dc[c] = self.dequant_chroma_dc(&cdc[c], qpc[c], 4 + c);
         }
-        let dqc = [self.dq_const(qpc, 4), self.dq_const(qpc, 5)];
+        let dqc = [self.dq_const(qpc[0], 4), self.dq_const(qpc[1], 5)];
         for c in 0..2 {
             for &(bx, by) in &CHROMA_4X4_SCAN_XY {
                 let mut ac_nz = false;
@@ -11929,7 +11937,7 @@ impl PixelCtx {
             poc1: &[],
             kind: &[],
         };
-        rusty_h264_common::deblock::filter_frame_rows_pre(
+        rusty_h264_common::deblock::filter_frame_rows_pre_cbcr(
             &mut self.rec_y,
             &mut self.rec_u,
             &mut self.rec_v,
@@ -14330,7 +14338,11 @@ mod tests {
     use super::*;
 
     fn fd(qp: u8, offset: i32) -> FrameDecoder {
-        FrameDecoder::new(1, 1, qp, offset, Vec::new(), 1, false, false, true)
+        fd_cbcr(qp, [offset; 2])
+    }
+
+    fn fd_cbcr(qp: u8, offsets: [i32; 2]) -> FrameDecoder {
+        FrameDecoder::new(1, 1, qp, offsets, Vec::new(), 1, false, false, true)
     }
 
     #[test]
@@ -14352,11 +14364,20 @@ mod tests {
     #[test]
     fn chroma_qp_index_offset_applied_and_clamped() {
         // Offset 0 reproduces the bare luma->chroma table (QP30 -> 29).
-        assert_eq!(fd(0, 0).chroma_qp_for(30), 29);
+        assert_eq!(fd(0, 0).chroma_qp_for(30, 0), 29);
         // Positive offset shifts the table lookup (QP30 + 2 -> table[2] = 31).
-        assert_eq!(fd(0, 2).chroma_qp_for(30), 31);
+        assert_eq!(fd(0, 2).chroma_qp_for(30, 0), 31);
         // The qPi index is clamped into 0..=51 before the lookup.
-        assert_eq!(fd(0, -12).chroma_qp_for(5), chroma_qp(0));
-        assert_eq!(fd(0, 99).chroma_qp_for(40), chroma_qp(51));
+        assert_eq!(fd(0, -12).chroma_qp_for(5, 0), chroma_qp(0));
+        assert_eq!(fd(0, 99).chroma_qp_for(40, 0), chroma_qp(51));
+    }
+
+    #[test]
+    fn second_chroma_qp_index_offset_drives_cr_only() {
+        // Cb follows `chroma_qp_index_offset`, Cr `second_chroma_qp_index_offset`.
+        let d = fd_cbcr(0, [0, 6]);
+        assert_eq!(d.chroma_qps(30), [chroma_qp(30), chroma_qp(36)]);
+        let d = fd_cbcr(0, [-4, 2]);
+        assert_eq!(d.chroma_qps(20), [chroma_qp(16), chroma_qp(22)]);
     }
 }

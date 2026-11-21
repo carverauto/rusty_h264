@@ -1598,7 +1598,10 @@ impl Decoder {
                 sps.pic_width_in_mbs,
                 sps.pic_height_in_mbs,
                 slice_qp,
-                pps.chroma_qp_index_offset,
+                [
+                    pps.chroma_qp_index_offset,
+                    pps.second_chroma_qp_index_offset,
+                ],
                 ref_list0,
                 num_ref_idx_l0,
                 pps.constrained_intra_pred_flag,

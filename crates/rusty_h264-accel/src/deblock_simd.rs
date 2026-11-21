@@ -297,6 +297,45 @@ pub fn deblock_chroma_eq4_h(cb_p1: &mut [u8], cr_p1: &mut [u8], stride: usize, a
     chroma_eq4_h_one(cr_p1, stride, alpha, beta);
 }
 
+/// Chroma, ONE plane, horizontal edge, bS<4. For a PPS whose Cr QP offset
+/// (`second_chroma_qp_index_offset`) differs from Cb's, the two planes filter
+/// with different thresholds and cannot share the joint call above.
+#[inline(never)]
+pub fn deblock_chroma_plane_lt4_v(
+    p1: &mut [u8],
+    stride: usize,
+    alpha: i32,
+    beta: i32,
+    tc: &[i8; 4],
+) {
+    assert!(p1.len() >= 3 * stride + 8);
+    chroma_lt4_v_one(p1, stride, alpha, beta, tc);
+}
+/// Chroma, ONE plane, horizontal edge, bS==4.
+#[inline(never)]
+pub fn deblock_chroma_plane_eq4_v(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(p1.len() >= 3 * stride + 8);
+    chroma_eq4_v_one(p1, stride, alpha, beta);
+}
+/// Chroma, ONE plane, vertical edge, bS<4.
+#[inline(never)]
+pub fn deblock_chroma_plane_lt4_h(
+    p1: &mut [u8],
+    stride: usize,
+    alpha: i32,
+    beta: i32,
+    tc: &[i8; 4],
+) {
+    assert!(p1.len() >= 7 * stride + 4);
+    chroma_lt4_h_one(p1, stride, alpha, beta, tc);
+}
+/// Chroma, ONE plane, vertical edge, bS==4.
+#[inline(never)]
+pub fn deblock_chroma_plane_eq4_h(p1: &mut [u8], stride: usize, alpha: i32, beta: i32) {
+    assert!(p1.len() >= 7 * stride + 4);
+    chroma_eq4_h_one(p1, stride, alpha, beta);
+}
+
 // One plane each. `dispatch!` expands to a `return` on the SIMD arm, so these MUST be
 // separate functions -- two dispatch! calls in one body would filter Cb and then return
 // without ever touching Cr. That mistake shipped 0/18 on the byte-identity gate.
