@@ -1526,7 +1526,14 @@ impl Decoder {
                 filter_offset_b = r.read_se()? * 2;
             }
         }
-        let slice_qp = (pps.pic_init_qp + slice_qp_delta).clamp(0, 51) as u8;
+        // SliceQPY = 26 + pic_init_qp_minus26 + slice_qp_delta must be in
+        // 0..=51 for 8-bit video (spec §7.4.3). Clamping an out-of-range value
+        // decoded the slice at a QP the stream never asked for; it is a
+        // malformed slice header.
+        let slice_qp = match u8::try_from(pps.pic_init_qp + slice_qp_delta) {
+            Ok(qp) if qp <= 51 => qp,
+            _ => return Err(DecodeError::Unsupported("slice QP out of range (7.4.3: 0..=51)")),
+        };
 
         // Synthesize placeholder short-term references for any gap in frame_num
         // (spec §8.2.5.2) so the DPB / PicNum mapping stays correct.

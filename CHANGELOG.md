@@ -8,6 +8,12 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ### Fixed
 
+- **Decoder: out-of-range quantiser fields are rejected, not clamped.** A PPS
+  with `pic_init_qp_minus26` outside -26..=25 or a chroma QP index offset
+  outside -12..=12, and a slice whose QP (26 + `pic_init_qp_minus26` +
+  `slice_qp_delta`) falls outside 0..=51, are malformed (H.264 §7.4.2.2,
+  §7.4.3). The decoder clamped them and decoded a picture the stream does not
+  describe; it now returns `DecodeError::Unsupported` naming the field.
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every
