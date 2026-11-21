@@ -15,6 +15,12 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
   wrong Cr plane and no error. Cb and Cr now each take `QPc` from their own
   offset (H.264 §8.5.8, §8.7.2.2). Streams whose PPS carries equal offsets,
   which is every x264 stream, decode byte-identically to before.
+- **Decoder: an `I_PCM` macroblock is deblocked at QP 0.** H.264 §8.7.2.2 gives
+  an `I_PCM` macroblock qP = 0 in the loop filter: its internal edges never
+  filter and its edges with coded neighbours average 0 with the neighbour's
+  QP. Both the CABAC and the CAVLC path recorded the running slice QP for it,
+  so every edge touching a PCM block was filtered at the wrong strength. The
+  running QP that the next macroblock predicts from is unchanged.
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every
