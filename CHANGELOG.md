@@ -39,6 +39,14 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
   corner does not, so the prediction read a sample from another slice. The
   corner's availability is now its own (slice membership and
   `constrained_intra_pred`, H.264 §6.4.11.2, §8.3.2.2.1).
+- **Decoder: a picture with a lost slice is an error, not a picture.** When a
+  middle slice of a multi-slice picture is missing, the following slices still
+  carry the picture to its last macroblock, and the decoder returned it with a
+  band no slice had decoded and no error. The `decode` call that completes such
+  a picture now returns `DecodeError::Truncated`, the variant already used for a
+  picture that never reached its last macroblock. Decoder state advances as for
+  a complete picture (it enters the DPB), so later pictures still decode;
+  `decode_stream` returns the error.
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every

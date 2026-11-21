@@ -1008,6 +1008,11 @@ struct PendingPic {
     poc: i32,
     next_mb: usize,
     total_mb: usize,
+    /// A slice of this picture started past the end of the previous one, so
+    /// the macroblocks in between were never decoded (a lost slice). Slices
+    /// are raster-contiguous here (FMO and ASO are not supported), so this is
+    /// exactly "some macroblock is not covered by any slice".
+    mb_gap: bool,
     slice_count: u16,
     /// Any slice of the picture enables the loop filter. Each macroblock is
     /// filtered with its own slice's parameters (`FrameDecoder::deblock`).
@@ -1654,6 +1659,7 @@ impl Decoder {
                 frame_num,
                 poc: pic_poc,
                 next_mb: 0,
+                mb_gap: false,
                 route_bits: 0,
                 route_cabac: pps.entropy_coding_mode_flag,
                 route_t8x8: pps.transform_8x8_mode_flag,
@@ -1677,6 +1683,12 @@ impl Decoder {
                     "slice continues a missing picture",
                 ));
             };
+            // A slice starting beyond the previous slice's end leaves the
+            // macroblocks in between undecoded: the picture can still reach its
+            // last macroblock, but it is incomplete (see `PendingPic::mb_gap`).
+            if first_mb_in_slice > pic.next_mb {
+                pic.mb_gap = true;
+            }
             pic.fd.begin_slice(slice_qp, ref_list0, num_ref_idx_l0);
             if is_b {
                 pic.fd.set_b_context(
@@ -1792,6 +1804,7 @@ impl Decoder {
         }
         let PendingPic {
             mut fd,
+            mb_gap,
             frame_num,
             poc,
             deblock,
@@ -1872,6 +1885,18 @@ impl Decoder {
         let (frame, pool) = fd.into_frame_recycle(crop_r, crop_b);
         self.grid_pool = pool;
         self.reclaim_retired();
+        // AN INCOMPLETE PICTURE IS AN ERROR, NOT A PICTURE. A lost slice left a
+        // band of macroblocks that no slice covered; returning the frame would
+        // hand the caller undecoded samples as if they were the picture. The
+        // decoder state has advanced exactly as for a complete picture (it is
+        // in the DPB, POC and frame_num move on), so later pictures still
+        // decode against it; only the output is withheld. Same variant as the
+        // other incomplete-picture report above (a picture displaced before
+        // its last macroblock).
+        if mb_gap {
+            self.out_pool = Some(frame);
+            return Err(DecodeError::Truncated);
+        }
         Ok(Some(frame))
     }
 
