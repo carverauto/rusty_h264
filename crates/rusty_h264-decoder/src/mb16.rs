@@ -289,6 +289,10 @@ pub struct FrameDecoder {
     /// residual-coded MBs this picture. Two integer adds per MB, no atomics.
     route_skip_mbs: u32,
     route_coded_mbs: u32,
+    /// Set by the CAVLC `I_PCM` arm, consumed by the slice loop's per-MB QP
+    /// store: an `I_PCM` macroblock enters the loop filter with qPp = 0
+    /// (spec §8.7.2.2), not with the running QPy it leaves unchanged.
+    pcm_mb: bool,
     /// Per-slice `(first_mb, idc == 2)` in decode order — drives the
     /// `disable_deblocking_filter_idc == 2` cross-slice-edge suppression.
     slice_bounds: Vec<(usize, bool)>,
@@ -884,6 +888,7 @@ impl FrameDecoder {
             transform_bypass: false,
             route_skip_mbs: 0,
             route_coded_mbs: 0,
+            pcm_mb: false,
             slice_bounds: Vec::new(),
             cur_idc2: false,
             mb_t8x8: refill(pool.mb_t8x8, mb_w * mb_h, false),
@@ -3969,9 +3974,11 @@ impl FrameDecoder {
                     // Neighbour context (§7.4.5 + §9.3.3.1.1.x inferences): intra, QPy
                     // unchanged (no mb_qp_delta — its ctxInc resets), CodedBlockPattern
                     // luma/chroma inferred 15/2, every coded_block_flag (incl. DC) 1,
-                    // nnz 16, chroma pred mode 0.
+                    // nnz 16, chroma pred mode 0. The running QPy carries on to the
+                    // next macroblock, but the loop filter sees this one at qPp = 0
+                    // (spec §8.7.2.2), so its deblock QP is 0, not `cur_qp`.
                     if let Some(p) = self.mb_qp.get_mut(addr) {
-                        *p = self.cur_qp;
+                        *p = 0;
                     }
                     if let Some(p) = cat.get_mut(addr) {
                         *p = 25;
@@ -5315,8 +5322,10 @@ impl FrameDecoder {
                 self.span_flush();
                 self.decode_mb(r, mbx, mby, is_p)?;
             }
+            // Deblock QP: QPy, except 0 for an I_PCM macroblock (spec §8.7.2.2).
+            let pcm = core::mem::take(&mut self.pcm_mb);
             if let Some(p) = self.mb_qp.get_mut(addr) {
-                *p = self.cur_qp;
+                *p = if pcm { 0 } else { self.cur_qp };
             }
             addr += 1;
             mbx += 1;
@@ -5387,6 +5396,7 @@ impl FrameDecoder {
             // ORDER: I_PCM writes pixels directly.
             self.edc_intra_sync();
             self.decode_ipcm(r, mb_x, mb_y)?;
+            self.pcm_mb = true;
         } else {
             return Err(MbError::Unsupported(
                 "only I_4x4 / I_16x16 / I_PCM macroblocks",
