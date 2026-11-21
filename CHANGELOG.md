@@ -8,6 +8,13 @@ based on [Keep a Changelog](https://keepachangelog.com/); this project uses
 
 ### Fixed
 
+- **Decoder: `second_chroma_qp_index_offset` drives the Cr plane.** A High
+  profile PPS may give Cr its own QP offset; the decoder parsed it and then used
+  the Cb offset (`chroma_qp_index_offset`) for both planes, in residual scaling
+  and in the loop filter alike, so a stream with unequal offsets decoded with a
+  wrong Cr plane and no error. Cb and Cr now each take `QPc` from their own
+  offset (H.264 §8.5.8, §8.7.2.2). Streams whose PPS carries equal offsets,
+  which is every x264 stream, decode byte-identically to before.
 - **Encoder: scrolling screen content is found by the fast preset's motion
   search.** A page of text scrolling a few rows per frame defeated the
   predictor-local diamond (it settles on a one-glyph sideways step), so every

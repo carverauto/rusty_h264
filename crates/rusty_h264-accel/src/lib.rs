@@ -36,7 +36,9 @@ pub use chroma_mc::{mc_chroma_w4, mc_chroma_w8};
 mod deblock_simd;
 pub use deblock_simd::{
     deblock_chroma_eq4_h, deblock_chroma_eq4_v, deblock_chroma_lt4_h, deblock_chroma_lt4_v,
-    deblock_luma_eq4_h, deblock_luma_eq4_v, deblock_luma_lt4_h, deblock_luma_lt4_v,
+    deblock_chroma_plane_eq4_h, deblock_chroma_plane_eq4_v, deblock_chroma_plane_lt4_h,
+    deblock_chroma_plane_lt4_v, deblock_luma_eq4_h, deblock_luma_eq4_v, deblock_luma_lt4_h,
+    deblock_luma_lt4_v,
 };
 mod luma_mc;
 mod satd_sad;

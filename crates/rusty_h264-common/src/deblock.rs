@@ -3111,7 +3111,41 @@ pub fn filter_frame_rows_pre(
     info: &BlockInfo,
 ) {
     filter_frame_rows_impl::<true>(
-        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offset, offset_a, offset_b, info,
+        y,
+        u,
+        v,
+        mb_w,
+        mb_h,
+        rows,
+        mb_qp,
+        [chroma_qp_offset; 2],
+        offset_a,
+        offset_b,
+        info,
+    )
+}
+
+/// [`filter_frame_rows_pre`] with a separate chroma QP offset per chroma
+/// component: `chroma_qp_offsets = [chroma_qp_index_offset,
+/// second_chroma_qp_index_offset]` (spec §7.4.2.2, §8.7.2.2). The Cb edges
+/// take their `QPc` from the first offset and the Cr edges from the second,
+/// so a High-profile PPS that signals two different offsets deblocks Cr with
+/// its own strength rather than Cb's.
+pub fn filter_frame_rows_pre_cbcr(
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    mb_w: usize,
+    mb_h: usize,
+    rows: core::ops::Range<usize>,
+    mb_qp: &[u8],
+    chroma_qp_offsets: [i32; 2],
+    offset_a: i32,
+    offset_b: i32,
+    info: &BlockInfo,
+) {
+    filter_frame_rows_impl::<true>(
+        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offsets, offset_a, offset_b, info,
     )
 }
 
@@ -3129,8 +3163,53 @@ pub fn filter_frame_rows(
     info: &BlockInfo,
 ) {
     filter_frame_rows_impl::<false>(
-        y, u, v, mb_w, mb_h, rows, mb_qp, chroma_qp_offset, offset_a, offset_b, info,
+        y,
+        u,
+        v,
+        mb_w,
+        mb_h,
+        rows,
+        mb_qp,
+        [chroma_qp_offset; 2],
+        offset_a,
+        offset_b,
+        info,
     )
+}
+
+/// One chroma edge filtered plane by plane, for a PPS whose
+/// `second_chroma_qp_index_offset` differs from `chroma_qp_index_offset`: Cb
+/// takes the thresholds `cb`, Cr the thresholds `cr`. `VERT` selects a vertical
+/// edge (`_h` kernels) over a horizontal one (`_v` kernels); `base` addresses
+/// p1 exactly as for the joint kernels.
+#[cfg(accel)]
+#[inline(never)]
+fn chroma_planes_split<const VERT: bool>(
+    u: &mut [u8],
+    v: &mut [u8],
+    base: usize,
+    ccw: usize,
+    bs4: [u8; 4],
+    cb: (i32, i32, &[i8; 8]),
+    cr: (i32, i32, &[i8; 8]),
+) {
+    for (plane, (alpha, beta, tcl)) in [(u, cb), (v, cr)] {
+        let p1 = &mut plane[base..];
+        if bs4 == [4u8; 4] {
+            if VERT {
+                rusty_h264_accel::deblock_chroma_plane_eq4_h(p1, ccw, alpha, beta);
+            } else {
+                rusty_h264_accel::deblock_chroma_plane_eq4_v(p1, ccw, alpha, beta);
+            }
+        } else {
+            let tc: [i8; 4] = bs4.map(|b| tcl[(b & 7) as usize]);
+            if VERT {
+                rusty_h264_accel::deblock_chroma_plane_lt4_h(p1, ccw, alpha, beta, &tc);
+            } else {
+                rusty_h264_accel::deblock_chroma_plane_lt4_v(p1, ccw, alpha, beta, &tc);
+            }
+        }
+    }
 }
 
 fn filter_frame_rows_impl<const PRE: bool>(
@@ -3141,7 +3220,7 @@ fn filter_frame_rows_impl<const PRE: bool>(
     mb_h: usize,
     rows: core::ops::Range<usize>,
     mb_qp: &[u8],
-    chroma_qp_offset: i32,
+    chroma_qp_offsets: [i32; 2],
     offset_a: i32,
     offset_b: i32,
     info: &BlockInfo,
@@ -3151,10 +3230,16 @@ fn filter_frame_rows_impl<const PRE: bool>(
     let ccw = mb_w * 8;
     // Per-edge QP: deblock strength uses the average of the two adjacent
     // macroblocks' QPy (spec §8.7.2). For an internal edge both sides share the
-    // current MB's QP. Chroma averages the two MBs' QPc.
-    let qpc = |qpy_val: i32| {
-        crate::predict::chroma_qp((qpy_val + chroma_qp_offset).clamp(0, 51) as u8) as i32
+    // current MB's QP. Chroma averages the two MBs' QPc, each derived with the
+    // offset of its own component (`c` 0 = Cb, 1 = Cr; spec §8.7.2.2).
+    let qpc = |c: usize, qpy_val: i32| {
+        crate::predict::chroma_qp((qpy_val + chroma_qp_offsets[c & 1]).clamp(0, 51) as u8) as i32
     };
+    // Cr shares Cb's thresholds unless the PPS signalled a different
+    // `second_chroma_qp_index_offset`; only then do the two planes filter
+    // separately. Frame-constant, so the common case keeps the joint kernels.
+    #[cfg(accel)]
+    let split_cr = chroma_qp_offsets[0] != chroma_qp_offsets[1];
     // Arms resolved ONCE per frame, never per macroblock (see `bs_twopass`).
     let fs = filtstat::on();
     let two_pass = bs_twopass();
@@ -3571,9 +3656,17 @@ fn filter_frame_rows_impl<const PRE: bool>(
                 // -> 1,381, binary +36, and spills 142 -> 147: the memo has to
                 // stay live across the whole chroma block, and two ops are
                 // cheaper than remembering whether you did them.
-                let qpc_cur = qpc(qp_cur);
+                let qpc_cur = qpc(0, qp_cur);
                 // Internal chroma thresholds: eager, like `int_y` above.
                 let int_c = thresholds_lanes(qpc_cur, offset_a, offset_b, &TC_CHROMA_LANES);
+                // Cr's own current QPc and internal thresholds, only when its
+                // offset differs from Cb's (`split_cr`).
+                let qpc_cur_cr = if split_cr { qpc(1, qp_cur) } else { qpc_cur };
+                let int_c_cr = if split_cr {
+                    thresholds_lanes(qpc_cur_cr, offset_a, offset_b, &TC_CHROMA_LANES)
+                } else {
+                    int_c
+                };
                 // vertical chroma edges → DeblockChromaLt4H/Eq4H (Cb+Cr together).
                 // CARRY THE EDGE INDEX, don't recompute `cxe / 2`. The divisor
                 // is a loop constant and the result is always 0 or 2, yet LLVM
@@ -3639,12 +3732,33 @@ fn filter_frame_rows_impl<const PRE: bool>(
                                 qp_cur
                             }
                         });
-                        thresholds_lanes((qpc(ql) + qpc_cur + 1) >> 1, offset_a, offset_b, &TC_CHROMA_LANES)
+                        thresholds_lanes((qpc(0, ql) + qpc_cur + 1) >> 1, offset_a, offset_b, &TC_CHROMA_LANES)
                     } else {
                         int_c
                     };
                     let base = (mb_y * 8) * ccw + (x - 2); // p1 (2 cols left of q0)
-                    if bs4 == [4u8; 4] {
+                    if split_cr {
+                        let (alpha_r, beta_r, tcr) = if mb_edge {
+                            let ql = qp_left.unwrap_or(qp_cur);
+                            thresholds_lanes(
+                                (qpc(1, ql) + qpc_cur_cr + 1) >> 1,
+                                offset_a,
+                                offset_b,
+                                &TC_CHROMA_LANES,
+                            )
+                        } else {
+                            int_c_cr
+                        };
+                        chroma_planes_split::<true>(
+                            u,
+                            v,
+                            base,
+                            ccw,
+                            bs4,
+                            (alpha_c, beta_c, tcc),
+                            (alpha_r, beta_r, tcr),
+                        );
+                    } else if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_chroma_eq4_h(
                             &mut u[base..],
                             &mut v[base..],
@@ -3711,12 +3825,33 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     let (alpha_c, beta_c, tcc) = if mb_edge {
                         let qu = *qp_up
                             .get_or_insert_with(|| qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32));
-                        thresholds_lanes((qpc(qu) + qpc_cur + 1) >> 1, offset_a, offset_b, &TC_CHROMA_LANES)
+                        thresholds_lanes((qpc(0, qu) + qpc_cur + 1) >> 1, offset_a, offset_b, &TC_CHROMA_LANES)
                     } else {
                         int_c
                     };
                     let base = (yy - 2) * ccw + mb_x * 8; // p1 (2 rows above q0)
-                    if bs4 == [4u8; 4] {
+                    if split_cr {
+                        let (alpha_r, beta_r, tcr) = if mb_edge {
+                            let qu = qp_up.unwrap_or(qp_cur);
+                            thresholds_lanes(
+                                (qpc(1, qu) + qpc_cur_cr + 1) >> 1,
+                                offset_a,
+                                offset_b,
+                                &TC_CHROMA_LANES,
+                            )
+                        } else {
+                            int_c_cr
+                        };
+                        chroma_planes_split::<false>(
+                            u,
+                            v,
+                            base,
+                            ccw,
+                            bs4,
+                            (alpha_c, beta_c, tcc),
+                            (alpha_r, beta_r, tcr),
+                        );
+                    } else if bs4 == [4u8; 4] {
                         rusty_h264_accel::deblock_chroma_eq4_v(
                             &mut u[base..],
                             &mut v[base..],
@@ -3740,20 +3875,24 @@ fn filter_frame_rows_impl<const PRE: bool>(
             #[cfg(not(accel))]
             {
                 // Chroma edge thresholds use the average of the two MBs' QPc.
-                let cur_qpc = qpc(qp_cur);
-                let (alpha_cv, beta_cv, tc0cv) = if mb_x > 0 {
-                    let ql = qp_row[mb_x - 1] as i32;
-                    thresholds((qpc(ql) + cur_qpc + 1) >> 1, offset_a, offset_b)
-                } else {
-                    (0, 0, [0; 3]) // unused (cxe==0 skipped at frame edge)
+                // Thresholds per chroma component `c` (0 = Cb, 1 = Cr): each takes
+                // its QPc from its own PPS offset (spec §8.7.2.2).
+                let chroma_thresholds = |c: usize| {
+                    let cur_qpc = qpc(c, qp_cur);
+                    let vert = if mb_x > 0 {
+                        let ql = qp_row[mb_x - 1] as i32;
+                        thresholds((qpc(c, ql) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                    } else {
+                        (0, 0, [0; 3]) // unused (cxe==0 skipped at frame edge)
+                    };
+                    let horz = if mb_y > 0 {
+                        let qu = qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32);
+                        thresholds((qpc(c, qu) + cur_qpc + 1) >> 1, offset_a, offset_b)
+                    } else {
+                        (0, 0, [0; 3])
+                    };
+                    (vert, horz, thresholds(cur_qpc, offset_a, offset_b))
                 };
-                let (alpha_ch, beta_ch, tc0ch) = if mb_y > 0 {
-                    let qu = qp_up_row.map_or(qp_cur, |r| r[mb_x] as i32);
-                    thresholds((qpc(qu) + cur_qpc + 1) >> 1, offset_a, offset_b)
-                } else {
-                    (0, 0, [0; 3])
-                };
-                let (alpha_ci, beta_ci, tc0ci) = thresholds(cur_qpc, offset_a, offset_b);
                 let tc0_of = |arr: [i32; 3], bs: i32| {
                     if (1..4).contains(&bs) {
                         arr[bs as usize - 1]
@@ -3808,7 +3947,12 @@ fn filter_frame_rows_impl<const PRE: bool>(
                     }
                     bs4
                 };
-                for plane in [&mut *u, &mut *v] {
+                for (c, plane) in [(0usize, &mut *u), (1usize, &mut *v)] {
+                    let (
+                        (alpha_cv, beta_cv, tc0cv),
+                        (alpha_ch, beta_ch, tc0ch),
+                        (alpha_ci, beta_ci, tc0ci),
+                    ) = chroma_thresholds(c);
                     for cxe in [0usize, 4] {
                         if cxe == 0 && mb_x == 0 {
                             continue;
