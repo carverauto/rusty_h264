@@ -357,6 +357,18 @@ pub struct Pps {
     pub scaling_present_8x8: [bool; 2],
 }
 
+/// `chroma_qp_index_offset` / `second_chroma_qp_index_offset` are -12..=12
+/// (spec §7.4.2.2).
+fn check_chroma_qp_offset(v: i32) -> Result<i32, DecodeError> {
+    if (-12..=12).contains(&v) {
+        Ok(v)
+    } else {
+        Err(DecodeError::Unsupported(
+            "chroma QP index offset out of range (7.4.2.2: -12..=12)",
+        ))
+    }
+}
+
 impl Pps {
     /// Parses a PPS RBSP. Rejects FMO/slice-groups cleanly; never panics.
     pub fn parse(rbsp: &[u8]) -> Result<Self, DecodeError> {
@@ -375,9 +387,18 @@ impl Pps {
         let num_ref_idx_l1_default = r.read_ue()? + 1;
         let weighted_pred = r.read_bit()?;
         let weighted_bipred_idc = r.read_bits(2)? as u8;
+        // Value ranges (spec §7.4.2.2, 8-bit video: QpBdOffsetY = 0). Out of
+        // range is a malformed PPS, not something to clamp into shape: a
+        // clamped QP or offset reconstructs a different picture than the
+        // stream describes, silently.
         let pic_init_qp = 26 + r.read_se()?;
+        if !(0..=51).contains(&pic_init_qp) {
+            return Err(DecodeError::Unsupported(
+                "pic_init_qp_minus26 out of range (7.4.2.2: -26..=25)",
+            ));
+        }
         let _pic_init_qs = r.read_se()?;
-        let chroma_qp_index_offset = r.read_se()?;
+        let chroma_qp_index_offset = check_chroma_qp_offset(r.read_se()?)?;
         let deblocking_filter_control_present_flag = r.read_bit()?;
         let constrained_intra_pred_flag = r.read_bit()?;
         let redundant_pic_cnt_present_flag = r.read_bit()?;
@@ -426,7 +447,7 @@ impl Pps {
                     }
                 }
             }
-            second_chroma_qp_index_offset = r.read_se()?;
+            second_chroma_qp_index_offset = check_chroma_qp_offset(r.read_se()?)?;
         }
         Ok(Self {
             pic_parameter_set_id,
