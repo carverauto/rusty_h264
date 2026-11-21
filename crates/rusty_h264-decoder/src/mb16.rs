@@ -4632,6 +4632,14 @@ impl FrameDecoder {
         if trace {
             eprintln!("# CABAC decoded {} MBs (of {total})", addr - first_mb);
         }
+        // OVERREAD = TRUNCATION. Past the end of the buffer the engine reads
+        // zeros, and zeros decode as plausible bins, so a slice cut off
+        // mid-data used to "complete" with a wrong tail and no error. A
+        // complete slice ends exactly on its rbsp_stop_one_bit (see
+        // `Cabac::overread`); having read beyond it means the data ran out.
+        if cab.overread() {
+            return Err(MbError::Truncated);
+        }
         self.edc_flush(); // slice end: no job crosses a slice boundary
                           // Return the pooled slice scratch (an error exit forfeits it — the
                           // next slice then refills fresh allocations, correctness unchanged).
